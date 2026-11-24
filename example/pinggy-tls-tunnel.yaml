@@ -1,0 +1,83 @@
+# Example: Pinggy TLS Tunneling Mode (Zero-Trust / Internal TLS Termination)
+#
+# Pinggy inspects SNI on port 443 and forwards raw encrypted TLS traffic through
+# the SSH reverse tunnel without decrypting it. This Gateway controller loads
+# `demo-tls-cert` and terminates TLS internally before routing to `echo-svc`.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-app
+  template:
+    metadata:
+      labels:
+        app: echo-app
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:1.0
+          args:
+            - "-listen=:8080"
+            - "-text=Hello from Kubernetes behind a Pinggy TLS tunnel!"
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-svc
+  namespace: default
+spec:
+  selector:
+    app: echo-app
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+# Create a real TLS Secret (e.g. via cert-manager or openssl):
+#   kubectl create secret tls demo-tls-cert --cert=tls.crt --key=tls.key
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: pinggy-tls-gateway
+  namespace: default
+  annotations:
+    ssh-tunnel.io/provider: "pinggy"
+    ssh-tunnel.io/ssh-server: "free.pinggy.io:443"
+    # For Pinggy Pro with a custom domain, set to "<token>+tls"
+    ssh-tunnel.io/ssh-username: "tls"
+    ssh-tunnel.io/tls-tunnel-mode: "true"
+spec:
+  gatewayClassName: ssh-tunnel
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: demo-tls-cert
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: echo-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: pinggy-tls-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: echo-svc
+          port: 80

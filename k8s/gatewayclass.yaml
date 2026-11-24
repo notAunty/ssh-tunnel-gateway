@@ -1,0 +1,6 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: ssh-tunnel
+spec:
+  controllerName: ssh-tunnel.gateway.networking.k8s.io/controller

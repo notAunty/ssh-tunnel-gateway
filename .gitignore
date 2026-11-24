@@ -1,0 +1,9 @@
+bin/
+dist/
+*.out
+coverage.html
+.env
+*.pem
+*.key
+id_ed25519*
+id_rsa*

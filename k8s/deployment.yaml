@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ssh-tunnel-key
+  namespace: ssh-gateway-system
+type: Opaque
+stringData:
+  # Replace with your unencrypted SSH private key (required for pico.sh tuns.sh / OpenSSH).
+  # Not needed for free-tier Pinggy (leave SSH_PRIVATE_KEY_PATH unset).
+  id_ed25519: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    REPLACE_WITH_YOUR_SSH_PRIVATE_KEY
+    -----END OPENSSH PRIVATE KEY-----
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssh-tunnel-gateway
+  namespace: ssh-gateway-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ssh-tunnel-gateway
+  template:
+    metadata:
+      labels:
+        app: ssh-tunnel-gateway
+    spec:
+      serviceAccountName: ssh-tunnel-gateway
+      containers:
+        - name: controller
+          image: ghcr.io/example/ssh-tunnel-gateway:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GATEWAY_CONTROLLER_NAME
+              value: "ssh-tunnel.gateway.networking.k8s.io/controller"
+            # Supported providers: pinggy | pico | localhostrun | openssh
+            - name: SSH_PROVIDER
+              value: "pinggy"
+            - name: SSH_SERVER
+              value: "free.pinggy.io:443"
+            # For Pinggy Pro custom domains, set SSH_USERNAME to "<token>+tls"
+            - name: SSH_USERNAME
+              value: "tls"
+            # Enable TLS tunneling mode: SaaS forwards raw TLS via SNI,
+            # and this controller terminates TLS internally using Gateway Secrets.
+            - name: TLS_TUNNEL_MODE
+              value: "true"
+            # Uncomment when using pico.sh (tuns.sh) or plain OpenSSH:
+            # - name: SSH_PRIVATE_KEY_PATH
+            #   value: "/ssh/id_ed25519"
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+          volumeMounts:
+            - name: ssh-key
+              mountPath: /ssh
+              readOnly: true
+      volumes:
+        - name: ssh-key
+          secret:
+            secretName: ssh-tunnel-key
+            defaultMode: 0400
+            optional: true
