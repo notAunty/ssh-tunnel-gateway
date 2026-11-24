@@ -1,60 +1,54 @@
 # ssh-tunnel-gateway
 
-A lightweight [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) implementation in Go that exposes Kubernetes `Service` workloads to the public internet over **outbound SSH reverse tunnels**, with first-class support for **TLS tunneling mode** (where the SaaS tunnel provider routes by SNI without decrypting traffic and TLS is terminated internally inside your cluster).
+A lightweight [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) implementation in Go that exposes Kubernetes `Service` workloads over **outbound SSH reverse tunnels**, supporting **HTTP, HTTPS (internal TLS termination), TLS (L4 SNI passthrough), and TCP** modes—including **wildcard subdomain tunnels** (`*.example.com`).
+
+## Supported Protocol Modes
+
+| Listener Protocol | Gateway API Route | Behavior |
+| :--- | :--- | :--- |
+| **`HTTP`** | `HTTPRoute` (`v1`) | Serves plaintext HTTP over the SSH tunnel (routed by exact or wildcard `Host` + `PathPrefix`/`Exact`). |
+| **`HTTPS`** (`tls.mode: Terminate`) | `HTTPRoute` (`v1`) | **TLS Tunneling Mode**: SaaS SSH provider forwards raw encrypted TLS by SNI without decrypting; this controller terminates TLS internally using `Gateway` `Secret` certs (including wildcard `*.example.com` SANs) and routes HTTP to backend Services. |
+| **`TLS`** (`tls.mode: Passthrough`) | `TLSRoute` (`v1alpha2`) | Peeks the TLS `ClientHello` SNI header non-destructively and splices raw encrypted TLS bytes straight to the backend pod (no backend certs held by the controller). Can **share port 443** with `HTTPS` on a single wildcard tunnel via the SNI demultiplexer (`internal/proxy/sni.go`). |
+| **`TCP`** | `TCPRoute` (`v1alpha2`) | Forwards raw L4 TCP streams over the SSH tunnel (e.g., Postgres, Redis, SSH) to the target `Service:Port`. |
 
 ## Architecture (Inspired by `caddyserver/gateway`)
 
-Modeled after [caddyserver/gateway](https://github.com/caddyserver/gateway)'s clean `controller-runtime` reconciliation loop and zero-downtime hot reload:
+Modeled after [caddyserver/gateway](https://github.com/caddyserver/gateway)'s `controller-runtime` reconciliation loop and zero-downtime hot reload:
 
-1. **Control Plane (`internal/controller/`)**: Watches standard Gateway API CRDs (`GatewayClass`, `Gateway`, `HTTPRoute`) and Kubernetes TLS `Secret`s (`kubernetes.io/tls`)—no custom CRDs required.
-2. **SSH Reverse Tunnel Manager (`internal/tunnel/`)**: Opens resilient outbound SSH connections (`golang.org/x/crypto/ssh`) with keepalives and exponential backoff, requesting remote TCP forwarding (`ssh.Client.Listen`).
-3. **Internal TLS Termination + Hot-Reload Router (`internal/proxy/`)**:
-   - In **TLS Tunneling Mode** (`ssh-tunnel.io/tls-tunnel-mode: "true"` or an `HTTPS` listener with `tls.mode: Terminate`), the SSH provider forwards raw encrypted TLS bytes over the tunnel. The controller wraps the SSH-forwarded `net.Listener` directly with `tls.NewListener(remoteLn, tlsStore.TLSConfig())` so TLS terminates **inside your cluster** using certificates from `Gateway.spec.listeners[].tls.certificateRefs`.
-   - Updating `HTTPRoute` rules or rotating a TLS `Secret` hot-reloads the in-memory router and SNI certificate map without tearing down active SSH tunnels.
+1. **Control Plane (`internal/controller/`)**: Watches standard Gateway API CRDs (`GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute`) and Kubernetes TLS `Secret`s (`kubernetes.io/tls`).
+2. **Multi-Mode SSH Tunnel Manager (`internal/tunnel/`)**: Supervises resilient outbound `golang.org/x/crypto/ssh` tunnels per listener group with keepalives and exponential backoff. `HTTPS` and `TLS` listeners on the same port (e.g., wildcard `*.example.com:443`) share a single SNI-multiplexed SSH tunnel.
+3. **SNI Demultiplexer + Internal TLS Terminator (`internal/proxy/`)**: Peeks `ClientHello` SNI on every incoming TLS connection—matching `TLSRoute` hostnames pass through untouched to backend pods, while all other traffic terminates TLS internally via `tls.Server` using hot-reloaded `Secret` certificates and routes through the L7 `HTTPRoute` proxy.
 
 ## Supported SSH Tunnel Providers
 
-| Provider | Default SSH Server | TLS Tunneling Mode Mechanism |
-| :--- | :--- | :--- |
-| **Pinggy** ([TLS Tunnels docs](https://pinggy.io/docs/tls_tunnels/)) | `free.pinggy.io:443` | Connects with `tls` or `<token>+tls` username and `-R 0:0`; Pinggy routes port 443 by SNI without decrypting. |
-| **Pico.sh (`tuns.sh`)** ([tuns docs](https://pico.sh/tuns)) | `tuns.sh:22` | Requests remote bind `<hostname>:443` and executes `sni-proxy=true` on the SSH session; `tuns.sh` forwards raw TLS by SNI. |
-| **localhost.run** | `localhost.run:22` | Requests remote bind `<hostname>:443` (custom domain TLS passthrough) or `0.0.0.0:80` for HTTP mode; override session flags via `ssh-tunnel.io/session-command`. |
-| **Plain OpenSSH** | Custom `host:22` | Requests remote bind `0.0.0.0:443` (requires `AllowTcpForwarding yes` and `GatewayPorts yes` in `sshd_config`). |
+| Provider | HTTP Mode | HTTPS / TLS Tunneling Mode (Wildcard-ready) | TCP Mode |
+| :--- | :--- | :--- | :--- |
+| **Pinggy** ([TLS docs](https://pinggy.io/docs/tls_tunnels/)) | `<token>@a.pinggy.io:443` | `<token>+tls@a.pinggy.io:443` (or `tls@free.pinggy.io:443`) | `<token>+tcp@a.pinggy.io:443` |
+| **Pico.sh `tuns.sh`** ([tuns docs](https://pico.sh/tuns)) | `-R *.example.com:80` | `-R *.example.com:443` + `sni-proxy=true` | `-R 0:0` (dynamic TCP port) |
+| **localhost.run** | `-R 0.0.0.0:80` | `-R <hostname>:443` (custom domain) | `-R 0.0.0.0:<port>` |
+| **Plain OpenSSH** | `-R 0.0.0.0:80` | `-R 0.0.0.0:443` (`GatewayPorts yes`) | `-R 0.0.0.0:<port>` |
 
 ## Related Projects
 
-- **[dguerri/k8s-ssh-gateway-controller](https://github.com/dguerri/k8s-ssh-gateway-controller)**: Existing Go Gateway API controller for SSH tunnels (`tuns.sh`, Serveo, OpenSSH) supporting `TLSRoute` passthrough where backend pods terminate TLS.
-- **[ngrok Kubernetes Operator](https://ngrok.com/docs/gateway/k8s/guides/using-gwapi)**: Official Gateway API operator for ngrok with [TLS routing / passthrough](https://ngrok.com/docs/gateway/k8s/guides/how-to/tls-routing) (uses ngrok's native agent protocol rather than raw SSH).
+- **[dguerri/k8s-ssh-gateway-controller](https://github.com/dguerri/k8s-ssh-gateway-controller)**: Existing Go Gateway API controller for SSH tunnels (`tuns.sh`, Serveo, OpenSSH) supporting `HTTPRoute`, `TCPRoute`, and `TLSRoute` passthrough.
+- **[ngrok Kubernetes Operator](https://ngrok.com/docs/gateway/k8s/guides/using-gwapi)**: Official Gateway API operator for ngrok with [TLS routing / passthrough](https://ngrok.com/docs/gateway/k8s/guides/how-to/tls-routing) over ngrok's native protocol.
 
 ## Quickstart
 
 ```bash
-# 1. Resolve go.sum and run unit tests
+# 1. Resolve go.sum and run unit tests (includes SNI demux + wildcard TLS + TCP tests)
 go mod tidy
 go test -v -race ./...
 
-# 2. Install standard Kubernetes Gateway API CRDs
+# 2. Install Gateway API experimental CRDs (includes TCPRoute & TLSRoute)
 make install-crds
 
 # 3. Build image and deploy the controller
 make docker-build IMAGE=your-registry/ssh-tunnel-gateway:latest
 make deploy
 
-# 4. Apply an example Gateway + HTTPRoute (Pinggy TLS tunneling mode)
-kubectl create secret tls demo-tls-cert --cert=tls.crt --key=tls.key
-kubectl apply -f example/pinggy-tls-tunnel.yaml
-
-# 5. Inspect the discovered public tunnel address
-kubectl get gateway pinggy-tls-gateway
+# 4. Apply the all-modes wildcard example (HTTP + HTTPS + TLS passthrough + TCP)
+kubectl create secret tls wildcard-example-tls --cert=tls.crt --key=tls.key
+kubectl apply -f example/all-modes-wildcard.yaml
+kubectl get gateway wildcard-multi-mode-gw
 ```
-
-## Configuration
-
-Global defaults are configured via environment variables on the controller `Deployment` (`k8s/deployment.yaml`) and can be overridden per `Gateway` with annotations:
-
-- `ssh-tunnel.io/provider`: `pinggy`, `pico`, `localhostrun`, or `openssh`
-- `ssh-tunnel.io/ssh-server`: Remote `host:port` (e.g., `a.pinggy.io:443`, `tuns.sh:22`)
-- `ssh-tunnel.io/ssh-username`: SSH username or Pinggy token (`<token>+tls`)
-- `ssh-tunnel.io/tls-tunnel-mode`: `"true"` (internal TLS termination) or `"false"` (provider-terminated HTTP)
-- `ssh-tunnel.io/remote-bind-address`: Explicit override for `ssh.Client.Listen("tcp", addr)`
-- `ssh-tunnel.io/session-command`: Optional SSH session command (defaults to `sni-proxy=true` for `pico` in TLS mode)

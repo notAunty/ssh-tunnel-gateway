@@ -3,7 +3,6 @@ package tunnel
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -21,31 +20,51 @@ import (
 	"github.com/example/ssh-tunnel-gateway/internal/proxy"
 )
 
+// TunnelConfig bundles an SSH tunnel specification with its hot-reloadable
+// data-plane state (HTTP routes, TLS passthrough rules, TLS certs, TCP backend).
+type TunnelConfig struct {
+	Spec           TunnelSpec
+	HTTPRoutes     []proxy.RouteRule
+	TLSPassthrough []proxy.TLSPassthroughRule
+	TLSCerts       []proxy.CertEntry
+	TCPBackend     string
+}
+
+// TunnelStatus reports the live state of a managed tunnel.
+type TunnelStatus struct {
+	TunnelKey    string
+	Mode         TunnelMode
+	AssignedHost string
+	Connected    bool
+}
+
 // StatusCallback is invoked when a tunnel connects or discovers its assigned public host.
-type StatusCallback func(gatewayKey string, assignedHost string, connected bool, lastErr error)
+type StatusCallback func(gatewayKey string, tunnelKey string, assignedHost string, connected bool, lastErr error)
 
 type managedTunnel struct {
-	spec   TunnelSpec
-	router *proxy.Router
-	tls    *proxy.TLSStore
-	cancel context.CancelFunc
-	done   chan struct{}
+	spec           TunnelSpec
+	router         *proxy.Router
+	tls            *proxy.TLSStore
+	tlsPassthrough *proxy.TLSPassthroughRouter
+	tcpRouter      *proxy.TCPRouter
+	cancel         context.CancelFunc
+	done           chan struct{}
 
 	mu           sync.RWMutex
 	assignedHost string
 	connected    bool
 }
 
-// Manager supervises one resilient SSH reverse tunnel per Kubernetes Gateway.
-// Routes and TLS certificates are updated in-place via hot reload without
-// tearing down active SSH sessions.
+// Manager supervises resilient outbound SSH reverse tunnels for all Gateway
+// listeners (HTTP, HTTPS, TLS, TCP). Routes, TLS certificates, and TCP backends
+// hot-reload in-place without dropping active SSH sessions.
 type Manager struct {
 	cfg    config.Config
 	log    logr.Logger
 	onStat StatusCallback
 
 	mu      sync.Mutex
-	tunnels map[string]*managedTunnel
+	tunnels map[string]*managedTunnel // keyed by TunnelSpec.TunnelKey
 }
 
 // NewManager creates a new SSH reverse-tunnel Manager.
@@ -64,73 +83,128 @@ func (m *Manager) SetStatusCallback(cb StatusCallback) {
 	m.mu.Unlock()
 }
 
-// ReconcileGateway ensures a tunnel exists for the given Gateway with the
-// latest routes and TLS certificates. If the SSH connection parameters did not
-// change, only the in-memory router and TLS store are hot-reloaded.
-func (m *Manager) ReconcileGateway(
+// ReconcileGatewayTunnels reconciles the full set of desired tunnels for a
+// Gateway (e.g. HTTP on 80, shared wildcard HTTPS+TLS on 443, TCP on 5432),
+// hot-reloading unchanged tunnels and pruning removed ones.
+func (m *Manager) ReconcileGatewayTunnels(
 	parentCtx context.Context,
-	spec TunnelSpec,
-	routes []proxy.RouteRule,
-	certs []proxy.CertEntry,
-) (assignedHost string, connected bool, err error) {
-	m.mu.Lock()
-	existing, ok := m.tunnels[spec.GatewayKey]
-	if ok && existing.spec == spec {
-		m.mu.Unlock()
-		if err := existing.router.Update(routes); err != nil {
-			return "", false, fmt.Errorf("hot-reload routes: %w", err)
-		}
-		if err := existing.tls.Reload(certs); err != nil {
-			return "", false, fmt.Errorf("hot-reload tls certs: %w", err)
-		}
-		existing.mu.RLock()
-		defer existing.mu.RUnlock()
-		return existing.assignedHost, existing.connected, nil
+	gatewayKey string,
+	desired []TunnelConfig,
+) ([]TunnelStatus, error) {
+	desiredKeys := make(map[string]struct{}, len(desired))
+	for _, tc := range desired {
+		desiredKeys[tc.Spec.TunnelKey] = struct{}{}
 	}
 
-	// Stop superseded tunnel if SSH connection parameters changed.
+	// Prune tunnels belonging to this Gateway that are no longer desired.
+	m.mu.Lock()
+	var toStop []*managedTunnel
+	for k, mt := range m.tunnels {
+		if mt.spec.GatewayKey == gatewayKey {
+			if _, keep := desiredKeys[k]; !keep {
+				toStop = append(toStop, mt)
+				delete(m.tunnels, k)
+			}
+		}
+	}
+	m.mu.Unlock()
+	for _, mt := range toStop {
+		mt.cancel()
+		<-mt.done
+	}
+
+	statuses := make([]TunnelStatus, 0, len(desired))
+	for _, tc := range desired {
+		st, err := m.reconcileSingle(parentCtx, tc)
+		if err != nil {
+			return statuses, err
+		}
+		statuses = append(statuses, st)
+	}
+	return statuses, nil
+}
+
+func (m *Manager) reconcileSingle(parentCtx context.Context, tc TunnelConfig) (TunnelStatus, error) {
+	m.mu.Lock()
+	existing, ok := m.tunnels[tc.Spec.TunnelKey]
+	if ok && existing.spec == tc.Spec {
+		m.mu.Unlock()
+		if err := existing.router.Update(tc.HTTPRoutes); err != nil {
+			return TunnelStatus{}, fmt.Errorf("hot-reload http routes: %w", err)
+		}
+		if err := existing.tls.Reload(tc.TLSCerts); err != nil {
+			return TunnelStatus{}, fmt.Errorf("hot-reload tls certs: %w", err)
+		}
+		existing.tlsPassthrough.Update(tc.TLSPassthrough)
+		existing.tcpRouter.Update(tc.TCPBackend)
+
+		existing.mu.RLock()
+		st := TunnelStatus{
+			TunnelKey:    tc.Spec.TunnelKey,
+			Mode:         tc.Spec.Mode,
+			AssignedHost: existing.assignedHost,
+			Connected:    existing.connected,
+		}
+		existing.mu.RUnlock()
+		return st, nil
+	}
+
 	if ok {
 		existing.cancel()
-		delete(m.tunnels, spec.GatewayKey)
+		delete(m.tunnels, tc.Spec.TunnelKey)
 	}
 
 	router := proxy.NewRouter()
-	if err := router.Update(routes); err != nil {
+	if err := router.Update(tc.HTTPRoutes); err != nil {
 		m.mu.Unlock()
-		return "", false, fmt.Errorf("init routes: %w", err)
+		return TunnelStatus{}, fmt.Errorf("init http routes: %w", err)
 	}
 	tlsStore := proxy.NewTLSStore()
-	if err := tlsStore.Reload(certs); err != nil {
+	if err := tlsStore.Reload(tc.TLSCerts); err != nil {
 		m.mu.Unlock()
-		return "", false, fmt.Errorf("init tls certs: %w", err)
+		return TunnelStatus{}, fmt.Errorf("init tls certs: %w", err)
 	}
+	tlsPassthrough := proxy.NewTLSPassthroughRouter()
+	tlsPassthrough.Update(tc.TLSPassthrough)
+	tcpRouter := proxy.NewTCPRouter()
+	tcpRouter.Update(tc.TCPBackend)
 
 	ctx, cancel := context.WithCancel(parentCtx)
 	mt := &managedTunnel{
-		spec:         spec,
-		router:       router,
-		tls:          tlsStore,
-		cancel:       cancel,
-		done:         make(chan struct{}),
-		assignedHost: spec.Hostname,
+		spec:           tc.Spec,
+		router:         router,
+		tls:            tlsStore,
+		tlsPassthrough: tlsPassthrough,
+		tcpRouter:      tcpRouter,
+		cancel:         cancel,
+		done:           make(chan struct{}),
+		assignedHost:   tc.Spec.Hostname,
 	}
-	m.tunnels[spec.GatewayKey] = mt
+	m.tunnels[tc.Spec.TunnelKey] = mt
 	m.mu.Unlock()
 
 	go m.runLoop(ctx, mt)
-	return mt.assignedHost, false, nil
+	return TunnelStatus{
+		TunnelKey:    tc.Spec.TunnelKey,
+		Mode:         tc.Spec.Mode,
+		AssignedHost: mt.assignedHost,
+		Connected:    false,
+	}, nil
 }
 
-// RemoveGateway stops and removes the SSH tunnel for a deleted Gateway.
+// RemoveGateway stops and removes all SSH tunnels belonging to a deleted Gateway.
 func (m *Manager) RemoveGateway(gatewayKey string) {
 	m.mu.Lock()
-	mt, ok := m.tunnels[gatewayKey]
-	if ok {
-		delete(m.tunnels, gatewayKey)
+	var toStop []*managedTunnel
+	for k, mt := range m.tunnels {
+		if mt.spec.GatewayKey == gatewayKey {
+			toStop = append(toStop, mt)
+			delete(m.tunnels, k)
+		}
 	}
 	m.mu.Unlock()
 
-	if ok {
+	for _, mt := range toStop {
 		mt.cancel()
 		<-mt.done
 	}
@@ -166,14 +240,15 @@ func (m *Manager) runLoop(ctx context.Context, mt *managedTunnel) {
 		mt.connected = false
 		host := mt.assignedHost
 		mt.mu.Unlock()
-		m.notify(mt.spec.GatewayKey, host, false, err)
+		m.notify(mt.spec.GatewayKey, mt.spec.TunnelKey, host, false, err)
 
 		if ctx.Err() != nil {
 			return
 		}
 
 		m.log.Error(err, "SSH tunnel disconnected, reconnecting",
-			"gateway", mt.spec.GatewayKey,
+			"tunnel", mt.spec.TunnelKey,
+			"mode", mt.spec.Mode,
 			"backoff", backoff.String(),
 		)
 
@@ -198,7 +273,8 @@ func (m *Manager) runOnce(ctx context.Context, mt *managedTunnel) error {
 	}
 
 	m.log.Info("dialing SSH reverse tunnel",
-		"gateway", mt.spec.GatewayKey,
+		"tunnel", mt.spec.TunnelKey,
+		"mode", mt.spec.Mode,
 		"provider", mt.spec.Provider,
 		"server", plan.ServerAddr,
 		"user", plan.Username,
@@ -220,59 +296,60 @@ func (m *Manager) runOnce(ctx context.Context, mt *managedTunnel) error {
 	client := ssh.NewClient(c, chans, reqs)
 	defer client.Close()
 
-	// Request reverse port forwarding on the remote SSH tunnel server.
 	remoteLn, err := client.Listen("tcp", plan.RemoteBindAddr)
 	if err != nil {
 		return fmt.Errorf("ssh remote listen %s: %w", plan.RemoteBindAddr, err)
 	}
 	defer remoteLn.Close()
 
-	// Open an SSH session for providers that take session commands (e.g. tuns.sh
-	// `sni-proxy=true`) or emit the assigned public URL over stdout (Pinggy / localhost.run).
 	if plan.SessionCommand != "" || plan.RequestPTY {
 		go m.runSession(ctx, client, mt, plan)
 	}
-
-	// Keepalive loop to detect dead NAT/firewall connections promptly.
 	go m.keepAlive(ctx, client)
 
 	mt.mu.Lock()
 	mt.connected = true
 	host := mt.assignedHost
 	mt.mu.Unlock()
-	m.notify(mt.spec.GatewayKey, host, true, nil)
+	m.notify(mt.spec.GatewayKey, mt.spec.TunnelKey, host, true, nil)
 
-	// In TLS Tunneling Mode, the SaaS provider forwards raw encrypted TLS bytes
-	// without decrypting them. We wrap the SSH-forwarded net.Listener directly
-	// with tls.NewListener so TLS is terminated internally inside our cluster.
-	var serveLn net.Listener = remoteLn
-	if mt.spec.TLSTunnelMode {
-		if !mt.tls.HasCertificates() {
-			fallbackHost := host
-			if fallbackHost == "" {
-				fallbackHost = "localhost"
-			}
-			selfSigned, genErr := proxy.GenerateSelfSignedCert([]string{fallbackHost})
-			if genErr == nil {
-				_ = mt.tls.Reload([]proxy.CertEntry{selfSigned})
-				m.log.Info("no Gateway TLS Secret attached yet; loaded temporary self-signed certificate",
-					"gateway", mt.spec.GatewayKey,
-					"cn", fallbackHost,
-				)
-			}
+	switch mt.spec.Mode {
+	case ModeTCP:
+		return m.serveTCP(ctx, remoteLn, mt.tcpRouter)
+	case ModeHTTPS, ModeTLS:
+		if mt.spec.TLSTunnelMode {
+			return m.serveTLSTunnel(ctx, remoteLn, mt, host)
 		}
-		serveLn = tls.NewListener(remoteLn, mt.tls.TLSConfig())
+		return m.serveHTTP(ctx, remoteLn, mt.router)
+	default:
+		return m.serveHTTP(ctx, remoteLn, mt.router)
 	}
+}
 
+func (m *Manager) serveTCP(ctx context.Context, remoteLn net.Listener, tcpRouter *proxy.TCPRouter) error {
+	go func() {
+		<-ctx.Done()
+		_ = remoteLn.Close()
+	}()
+	for {
+		conn, err := remoteLn.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		go tcpRouter.Handle(conn)
+	}
+}
+
+func (m *Manager) serveHTTP(ctx context.Context, remoteLn net.Listener, router *proxy.Router) error {
 	srv := &http.Server{
-		Handler:           mt.router,
+		Handler:           router,
 		ReadHeaderTimeout: 15 * time.Second,
 	}
-
 	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.Serve(serveLn)
-	}()
+	go func() { errCh <- srv.Serve(remoteLn) }()
 
 	select {
 	case <-ctx.Done():
@@ -288,10 +365,51 @@ func (m *Manager) runOnce(ctx context.Context, mt *managedTunnel) error {
 	}
 }
 
+// serveTLSTunnel handles TLS Tunneling Mode: raw encrypted TLS streams arrive
+// over the SSH reverse tunnel, ClientHello SNI is peeked, matching TLSRoutes
+// pass through untouched to backend pods, and HTTPS traffic terminates TLS
+// internally using Gateway Secrets before routing to HTTPRoutes.
+func (m *Manager) serveTLSTunnel(ctx context.Context, remoteLn net.Listener, mt *managedTunnel, host string) error {
+	if !mt.tls.HasCertificates() {
+		fallbackHost := host
+		if fallbackHost == "" {
+			fallbackHost = "localhost"
+		}
+		if selfSigned, err := proxy.GenerateSelfSignedCert([]string{fallbackHost}); err == nil {
+			_ = mt.tls.Reload([]proxy.CertEntry{selfSigned})
+			m.log.Info("no Gateway TLS Secret attached yet; loaded temporary self-signed certificate",
+				"tunnel", mt.spec.TunnelKey,
+				"cn", fallbackHost,
+			)
+		}
+	}
+
+	httpChLn := proxy.NewChannelListener(remoteLn.Addr())
+	srv := &http.Server{
+		Handler:           mt.router,
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+	go func() { _ = srv.Serve(httpChLn) }()
+
+	go func() {
+		<-ctx.Done()
+		_ = remoteLn.Close()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	err := proxy.ServeTLSMultiplexed(remoteLn, mt.tlsPassthrough, mt.tls, httpChLn)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
 func (m *Manager) runSession(ctx context.Context, client *ssh.Client, mt *managedTunnel, plan ResolvedSSHPlan) {
 	sess, err := client.NewSession()
 	if err != nil {
-		m.log.Error(err, "failed to open SSH session", "gateway", mt.spec.GatewayKey)
+		m.log.Error(err, "failed to open SSH session", "tunnel", mt.spec.TunnelKey)
 		return
 	}
 	defer sess.Close()
@@ -312,14 +430,14 @@ func (m *Manager) runSession(ctx context.Context, client *ssh.Client, mt *manage
 	if plan.SessionCommand != "" {
 		if err := sess.Start(plan.SessionCommand); err != nil {
 			m.log.Error(err, "failed to start SSH session command",
-				"gateway", mt.spec.GatewayKey,
+				"tunnel", mt.spec.TunnelKey,
 				"command", plan.SessionCommand,
 			)
 			return
 		}
 	} else {
 		if err := sess.Shell(); err != nil {
-			m.log.Error(err, "failed to start SSH shell", "gateway", mt.spec.GatewayKey)
+			m.log.Error(err, "failed to start SSH shell", "tunnel", mt.spec.TunnelKey)
 			return
 		}
 	}
@@ -335,11 +453,12 @@ func (m *Manager) runSession(ctx context.Context, client *ssh.Client, mt *manage
 				connected := mt.connected
 				mt.mu.Unlock()
 				if changed {
-					m.log.Info("discovered public tunnel hostname",
-						"gateway", mt.spec.GatewayKey,
-						"hostname", host,
+					m.log.Info("discovered public tunnel endpoint",
+						"tunnel", mt.spec.TunnelKey,
+						"mode", mt.spec.Mode,
+						"endpoint", host,
 					)
-					m.notify(mt.spec.GatewayKey, host, connected, nil)
+					m.notify(mt.spec.GatewayKey, mt.spec.TunnelKey, host, connected, nil)
 				}
 			}
 		}
@@ -415,11 +534,11 @@ func (m *Manager) buildSSHClientConfig(username string) (*ssh.ClientConfig, erro
 	}, nil
 }
 
-func (m *Manager) notify(gatewayKey, host string, connected bool, err error) {
+func (m *Manager) notify(gatewayKey, tunnelKey, host string, connected bool, err error) {
 	m.mu.Lock()
 	cb := m.onStat
 	m.mu.Unlock()
 	if cb != nil {
-		cb(gatewayKey, host, connected, err)
+		cb(gatewayKey, tunnelKey, host, connected, err)
 	}
 }

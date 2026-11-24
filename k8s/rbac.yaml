@@ -15,10 +15,10 @@ metadata:
   name: ssh-tunnel-gateway-role
 rules:
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses", "gateways", "httproutes"]
+    resources: ["gatewayclasses", "gateways", "httproutes", "tlsroutes", "tcproutes"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status"]
+    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status", "tlsroutes/status", "tcproutes/status"]
     verbs: ["get", "update", "patch"]
   - apiGroups: [""]
     resources: ["secrets", "services"]

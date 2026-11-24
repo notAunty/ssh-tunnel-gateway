@@ -21,8 +21,9 @@ fmt:
 docker-build:
 	docker build -t $(IMAGE) .
 
+# Experimental channel includes TCPRoute and TLSRoute CRDs in addition to GatewayClass, Gateway, and HTTPRoute.
 install-crds:
-	kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+	kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/experimental-install.yaml
 
 deploy:
 	kubectl apply -f k8s/rbac.yaml

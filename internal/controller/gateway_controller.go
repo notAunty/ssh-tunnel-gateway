@@ -16,15 +16,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
 	"github.com/example/ssh-tunnel-gateway/internal/config"
 	"github.com/example/ssh-tunnel-gateway/internal/proxy"
 	"github.com/example/ssh-tunnel-gateway/internal/tunnel"
 )
 
-// GatewayReconciler watches Gateways, HTTPRoutes, and TLS Secrets, compiling
-// them into hot-reloaded reverse proxy routes, internal TLS certificates, and
-// resilient outbound SSH reverse tunnels (modeled on caddyserver/gateway).
+// GatewayReconciler watches Gateways, HTTPRoutes, TLSRoutes, TCPRoutes, and
+// TLS Secrets, compiling them into hot-reloaded multi-mode SSH reverse tunnels:
+//   - HTTP  (HTTPRoute)
+//   - HTTPS (HTTPRoute + internal TLS termination via TLS tunneling mode)
+//   - TLS   (TLSRoute L4 SNI passthrough, shareable on port 443 with HTTPS)
+//   - TCP   (TCPRoute raw L4 TCP forwarding)
 type GatewayReconciler struct {
 	client.Client
 	Config        config.Config
@@ -43,7 +47,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	// Verify this Gateway belongs to our GatewayClass.
 	var gc gatewayv1.GatewayClass
 	if err := r.Get(ctx, types.NamespacedName{Name: string(gw.Spec.GatewayClassName)}, &gc); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -52,30 +55,41 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	// 1. Resolve SSH tunnel parameters from global defaults + Gateway annotations.
-	spec := r.buildTunnelSpec(&gw)
-
-	// 2. Load TLS certificates from Gateway.spec.listeners[].tls.certificateRefs
-	//    so TLS can be terminated internally when TLS tunneling mode is enabled.
+	// 1. Load TLS Secrets referenced by Gateway listeners.
 	certs, certErr := r.loadGatewayCerts(ctx, &gw)
 	if certErr != nil {
 		logger.Error(certErr, "failed to load Gateway TLS certificates", "gateway", req.NamespacedName)
 	}
 
-	// 3. Collect all HTTPRoutes referencing this Gateway.
-	routes, attachedCount, err := r.collectHTTPRoutes(ctx, &gw)
+	// 2. Collect HTTPRoutes, TLSRoutes, and TCPRoutes attached to this Gateway.
+	httpRules, httpCount, err := r.collectHTTPRoutes(ctx, &gw)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	tlsRules, tlsCount, err := r.collectTLSRoutes(ctx, &gw)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	tcpBackendsBySection, tcpCount, err := r.collectTCPRoutes(ctx, &gw)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 4. Reconcile the SSH reverse tunnel and hot-reload routes + TLS certs.
-	assignedHost, connected, err := r.TunnelManager.ReconcileGateway(context.Background(), spec, routes, certs)
+	// 3. Group listeners into desired SSH tunnels.
+	//    HTTPS and TLS listeners sharing the same port (e.g. wildcard *.example.com:443)
+	//    share a single SNI-multiplexed TLS tunnel so internal HTTPS termination and
+	//    L4 TLS passthrough coexist seamlessly on one SSH session.
+	desired := r.buildDesiredTunnels(&gw, httpRules, tlsRules, certs, tcpBackendsBySection)
+
+	// 4. Reconcile tunnels and hot-reload data plane state.
+	gwKey := req.NamespacedName.String()
+	statuses, err := r.TunnelManager.ReconcileGatewayTunnels(context.Background(), gwKey, desired)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 5. Update Gateway.status (Accepted, Programmed, Addresses, ListenerStatus).
-	r.updateGatewayStatus(&gw, assignedHost, connected, attachedCount, certErr)
+	// 5. Update Gateway.status.
+	r.updateGatewayStatus(&gw, statuses, httpCount, tlsCount, tcpCount, certErr)
 	if err := r.Status().Update(ctx, &gw); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -83,7 +97,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
-func (r *GatewayReconciler) buildTunnelSpec(gw *gatewayv1.Gateway) tunnel.TunnelSpec {
+func (r *GatewayReconciler) buildDesiredTunnels(
+	gw *gatewayv1.Gateway,
+	httpRules []proxy.RouteRule,
+	tlsRules []proxy.TLSPassthroughRule,
+	certs []proxy.CertEntry,
+	tcpBackends map[string]string,
+) []tunnel.TunnelConfig {
 	ann := gw.Annotations
 	if ann == nil {
 		ann = map[string]string{}
@@ -93,58 +113,119 @@ func (r *GatewayReconciler) buildTunnelSpec(gw *gatewayv1.Gateway) tunnel.Tunnel
 	if v := strings.TrimSpace(ann[config.AnnotationProvider]); v != "" {
 		provider = config.ProviderType(strings.ToLower(v))
 	}
-
 	server := r.Config.SSHServer
 	if v := strings.TrimSpace(ann[config.AnnotationSSHServer]); v != "" {
 		server = v
 	}
-
 	username := r.Config.SSHUsername
 	if v := strings.TrimSpace(ann[config.AnnotationSSHUsername]); v != "" {
 		username = v
 	}
-
-	// Enable TLS tunneling mode if annotated explicitly, or if any listener uses
-	// HTTPS with tls.mode == Terminate (the default for HTTPS listeners).
-	tlsTunnelMode := r.Config.TLSTunnelMode
-	if v := strings.TrimSpace(ann[config.AnnotationTLSTunnelMode]); v != "" {
-		if parsed, err := strconv.ParseBool(v); err == nil {
-			tlsTunnelMode = parsed
-		}
-	} else {
-		for _, l := range gw.Spec.Listeners {
-			if l.Protocol == gatewayv1.HTTPSProtocolType {
-				if l.TLS == nil || l.TLS.Mode == nil || *l.TLS.Mode == gatewayv1.TLSModeTerminate {
-					tlsTunnelMode = true
-					break
-				}
-			}
-		}
-	}
-
-	var hostname string
-	for _, l := range gw.Spec.Listeners {
-		if l.Hostname != nil && *l.Hostname != "" {
-			hostname = string(*l.Hostname)
-			break
-		}
-	}
-
 	sessionCmd := r.Config.SessionCommand
 	if v := strings.TrimSpace(ann[config.AnnotationSessionCommand]); v != "" {
 		sessionCmd = v
 	}
-
-	return tunnel.TunnelSpec{
-		GatewayKey:     types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}.String(),
-		Provider:       provider,
-		SSHServer:      server,
-		SSHUsername:    username,
-		Hostname:       hostname,
-		TLSTunnelMode:  tlsTunnelMode,
-		RemoteBindAddr: strings.TrimSpace(ann[config.AnnotationRemoteBindAddress]),
-		SessionCommand: sessionCmd,
+	explicitTLSMode := r.Config.TLSTunnelMode
+	hasExplicitTLS := false
+	if v := strings.TrimSpace(ann[config.AnnotationTLSTunnelMode]); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			explicitTLSMode = parsed
+			hasExplicitTLS = true
+		}
 	}
+
+	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}.String()
+
+	// Deduplicate shared tunnels by (modeGroup, port).
+	// HTTPS and TLS on the same port share a single TLS-multiplexed tunnel.
+	byKey := make(map[string]tunnel.TunnelConfig)
+	var order []string
+
+	for _, l := range gw.Spec.Listeners {
+		var hostname string
+		if l.Hostname != nil {
+			hostname = string(*l.Hostname)
+		}
+
+		var mode tunnel.TunnelMode
+		var tlsTunnel bool
+		var keyGroup string
+
+		switch l.Protocol {
+		case gatewayv1.HTTPProtocolType:
+			mode = tunnel.ModeHTTP
+			tlsTunnel = false
+			keyGroup = "http"
+		case gatewayv1.HTTPSProtocolType:
+			mode = tunnel.ModeHTTPS
+			tlsTunnel = true
+			if hasExplicitTLS {
+				tlsTunnel = explicitTLSMode
+			}
+			keyGroup = "tls"
+		case gatewayv1.TLSProtocolType:
+			mode = tunnel.ModeTLS
+			tlsTunnel = true
+			keyGroup = "tls"
+		case gatewayv1.TCPProtocolType:
+			mode = tunnel.ModeTCP
+			tlsTunnel = false
+			keyGroup = fmt.Sprintf("tcp-%s", l.Name)
+		default:
+			continue
+		}
+
+		tKey := fmt.Sprintf("%s/%s/%d", gwKey, keyGroup, l.Port)
+		if existing, exists := byKey[tKey]; exists {
+			// Prefer wildcard hostname (e.g. *.example.com) if a shared port-443
+			// tunnel has both exact and wildcard listeners.
+			if strings.HasPrefix(hostname, "*.") && !strings.HasPrefix(existing.Spec.Hostname, "*.") {
+				existing.Spec.Hostname = hostname
+			}
+			byKey[tKey] = existing
+			continue
+		}
+
+		tc := tunnel.TunnelConfig{
+			Spec: tunnel.TunnelSpec{
+				TunnelKey:      tKey,
+				GatewayKey:     gwKey,
+				Mode:           mode,
+				Port:           int32(l.Port),
+				Provider:       provider,
+				SSHServer:      server,
+				SSHUsername:    username,
+				Hostname:       hostname,
+				TLSTunnelMode:  tlsTunnel,
+				RemoteBindAddr: strings.TrimSpace(ann[config.AnnotationRemoteBindAddress]),
+				SessionCommand: sessionCmd,
+			},
+		}
+
+		switch mode {
+		case tunnel.ModeHTTP:
+			tc.HTTPRoutes = httpRules
+		case tunnel.ModeHTTPS, tunnel.ModeTLS:
+			tc.HTTPRoutes = httpRules
+			tc.TLSPassthrough = tlsRules
+			tc.TLSCerts = certs
+		case tunnel.ModeTCP:
+			if b, ok := tcpBackends[string(l.Name)]; ok {
+				tc.TCPBackend = b
+			} else if b, ok := tcpBackends[""]; ok {
+				tc.TCPBackend = b
+			}
+		}
+
+		byKey[tKey] = tc
+		order = append(order, tKey)
+	}
+
+	desired := make([]tunnel.TunnelConfig, 0, len(order))
+	for _, k := range order {
+		desired = append(desired, byKey[k])
+	}
+	return desired
 }
 
 func (r *GatewayReconciler) loadGatewayCerts(ctx context.Context, gw *gatewayv1.Gateway) ([]proxy.CertEntry, error) {
@@ -196,7 +277,7 @@ func (r *GatewayReconciler) collectHTTPRoutes(ctx context.Context, gw *gatewayv1
 
 	for i := range list.Items {
 		route := &list.Items[i]
-		if !routeTargetsGateway(route, gw) {
+		if !parentRefsTargetGateway(route.Spec.ParentRefs, route.Namespace, gw) {
 			continue
 		}
 		attached++
@@ -210,7 +291,6 @@ func (r *GatewayReconciler) collectHTTPRoutes(ctx context.Context, gw *gatewayv1
 			if len(rule.BackendRefs) == 0 {
 				continue
 			}
-			// Naive selection: pick the first Service backendRef.
 			bref := rule.BackendRefs[0]
 			svcNS := route.Namespace
 			if bref.Namespace != nil && *bref.Namespace != "" {
@@ -252,27 +332,127 @@ func (r *GatewayReconciler) collectHTTPRoutes(ctx context.Context, gw *gatewayv1
 			}
 		}
 
-		// Best-effort status update on the HTTPRoute.
 		r.updateHTTPRouteStatus(ctx, route, gw)
 	}
 
 	return rules, attached, nil
 }
 
-func routeTargetsGateway(route *gatewayv1.HTTPRoute, gw *gatewayv1.Gateway) bool {
-	for _, ref := range route.Spec.ParentRefs {
+func (r *GatewayReconciler) collectTLSRoutes(ctx context.Context, gw *gatewayv1.Gateway) ([]proxy.TLSPassthroughRule, int32, error) {
+	var list gatewayv1alpha2.TLSRouteList
+	if err := r.List(ctx, &list); err != nil {
+		// Gracefully allow clusters where experimental TLSRoute CRD is not installed.
+		if meta.IsNoMatchError(err) {
+			return nil, 0, nil
+		}
+		return nil, 0, fmt.Errorf("list TLSRoutes: %w", err)
+	}
+
+	var rules []proxy.TLSPassthroughRule
+	var attached int32
+
+	for i := range list.Items {
+		route := &list.Items[i]
+		if !parentRefsTargetGateway(route.Spec.ParentRefs, route.Namespace, gw) {
+			continue
+		}
+		attached++
+
+		hostnames := make([]string, 0, len(route.Spec.Hostnames))
+		for _, h := range route.Spec.Hostnames {
+			hostnames = append(hostnames, string(h))
+		}
+
+		for _, rule := range route.Spec.Rules {
+			if len(rule.BackendRefs) == 0 {
+				continue
+			}
+			bref := rule.BackendRefs[0]
+			svcNS := route.Namespace
+			if bref.Namespace != nil && *bref.Namespace != "" {
+				svcNS = string(*bref.Namespace)
+			}
+			port := int32(443)
+			if bref.Port != nil {
+				port = int32(*bref.Port)
+			}
+			rules = append(rules, proxy.TLSPassthroughRule{
+				Hostnames: hostnames,
+				Backend:   fmt.Sprintf("%s.%s.svc.cluster.local:%d", bref.Name, svcNS, port),
+			})
+		}
+	}
+
+	return rules, attached, nil
+}
+
+func (r *GatewayReconciler) collectTCPRoutes(ctx context.Context, gw *gatewayv1.Gateway) (map[string]string, int32, error) {
+	var list gatewayv1alpha2.TCPRouteList
+	if err := r.List(ctx, &list); err != nil {
+		// Gracefully allow clusters where experimental TCPRoute CRD is not installed.
+		if meta.IsNoMatchError(err) {
+			return map[string]string{}, 0, nil
+		}
+		return nil, 0, fmt.Errorf("list TCPRoutes: %w", err)
+	}
+
+	backends := make(map[string]string)
+	var attached int32
+
+	for i := range list.Items {
+		route := &list.Items[i]
+		matchedSections := matchingSectionsForGateway(route.Spec.ParentRefs, route.Namespace, gw)
+		if len(matchedSections) == 0 {
+			continue
+		}
+		attached++
+
+		for _, rule := range route.Spec.Rules {
+			if len(rule.BackendRefs) == 0 {
+				continue
+			}
+			bref := rule.BackendRefs[0]
+			svcNS := route.Namespace
+			if bref.Namespace != nil && *bref.Namespace != "" {
+				svcNS = string(*bref.Namespace)
+			}
+			port := int32(80)
+			if bref.Port != nil {
+				port = int32(*bref.Port)
+			}
+			addr := fmt.Sprintf("%s.%s.svc.cluster.local:%d", bref.Name, svcNS, port)
+			for _, sec := range matchedSections {
+				backends[sec] = addr
+			}
+		}
+	}
+
+	return backends, attached, nil
+}
+
+func parentRefsTargetGateway(refs []gatewayv1.ParentReference, routeNS string, gw *gatewayv1.Gateway) bool {
+	return len(matchingSectionsForGateway(refs, routeNS, gw)) > 0
+}
+
+func matchingSectionsForGateway(refs []gatewayv1.ParentReference, routeNS string, gw *gatewayv1.Gateway) []string {
+	var sections []string
+	for _, ref := range refs {
 		if ref.Kind != nil && *ref.Kind != "Gateway" {
 			continue
 		}
-		refNS := route.Namespace
+		refNS := routeNS
 		if ref.Namespace != nil && *ref.Namespace != "" {
 			refNS = string(*ref.Namespace)
 		}
 		if refNS == gw.Namespace && string(ref.Name) == gw.Name {
-			return true
+			sec := ""
+			if ref.SectionName != nil {
+				sec = string(*ref.SectionName)
+			}
+			sections = append(sections, sec)
 		}
 	}
-	return false
+	return sections
 }
 
 func (r *GatewayReconciler) updateHTTPRouteStatus(ctx context.Context, route *gatewayv1.HTTPRoute, gw *gatewayv1.Gateway) {
@@ -309,9 +489,8 @@ func (r *GatewayReconciler) updateHTTPRouteStatus(ctx context.Context, route *ga
 
 func (r *GatewayReconciler) updateGatewayStatus(
 	gw *gatewayv1.Gateway,
-	assignedHost string,
-	connected bool,
-	attachedRoutes int32,
+	statuses []tunnel.TunnelStatus,
+	httpCount, tlsCount, tcpCount int32,
 	certErr error,
 ) {
 	meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
@@ -322,13 +501,33 @@ func (r *GatewayReconciler) updateGatewayStatus(
 		Message:            "Gateway accepted by ssh-tunnel-gateway",
 	})
 
+	allConnected := len(statuses) > 0
+	var addrs []gatewayv1.GatewayStatusAddress
+	seenAddr := make(map[string]struct{})
+	addrType := gatewayv1.HostnameAddressType
+
+	for _, st := range statuses {
+		if !st.Connected {
+			allConnected = false
+		}
+		if st.AssignedHost != "" {
+			if _, dup := seenAddr[st.AssignedHost]; !dup {
+				seenAddr[st.AssignedHost] = struct{}{}
+				addrs = append(addrs, gatewayv1.GatewayStatusAddress{
+					Type:  &addrType,
+					Value: st.AssignedHost,
+				})
+			}
+		}
+	}
+
 	progStatus := metav1.ConditionTrue
 	progReason := string(gatewayv1.GatewayReasonProgrammed)
-	progMsg := "SSH reverse tunnel active and serving traffic"
-	if !connected {
+	progMsg := "All SSH reverse tunnels active and serving traffic"
+	if !allConnected {
 		progStatus = metav1.ConditionFalse
 		progReason = string(gatewayv1.GatewayReasonPending)
-		progMsg = "Establishing SSH reverse tunnel"
+		progMsg = "Establishing SSH reverse tunnel(s)"
 	}
 	if certErr != nil {
 		progStatus = metav1.ConditionFalse
@@ -344,24 +543,32 @@ func (r *GatewayReconciler) updateGatewayStatus(
 		Message:            progMsg,
 	})
 
-	if assignedHost != "" {
-		addrType := gatewayv1.HostnameAddressType
-		gw.Status.Addresses = []gatewayv1.GatewayStatusAddress{
-			{
-				Type:  &addrType,
-				Value: assignedHost,
-			},
-		}
+	if len(addrs) > 0 {
+		gw.Status.Addresses = addrs
 	}
 
 	listeners := make([]gatewayv1.ListenerStatus, 0, len(gw.Spec.Listeners))
 	for _, l := range gw.Spec.Listeners {
+		var attached int32
+		var kind gatewayv1.Kind
+		switch l.Protocol {
+		case gatewayv1.HTTPProtocolType, gatewayv1.HTTPSProtocolType:
+			attached = httpCount
+			kind = "HTTPRoute"
+		case gatewayv1.TLSProtocolType:
+			attached = tlsCount
+			kind = "TLSRoute"
+		case gatewayv1.TCPProtocolType:
+			attached = tcpCount
+			kind = "TCPRoute"
+		default:
+			kind = "HTTPRoute"
+		}
+
 		listeners = append(listeners, gatewayv1.ListenerStatus{
 			Name:           l.Name,
-			AttachedRoutes: attachedRoutes,
-			SupportedKinds: []gatewayv1.RouteGroupKind{
-				{Kind: "HTTPRoute"},
-			},
+			AttachedRoutes: attached,
+			SupportedKinds: []gatewayv1.RouteGroupKind{{Kind: kind}},
 			Conditions: []metav1.Condition{
 				{
 					Type:               string(gatewayv1.ListenerConditionAccepted),
@@ -384,18 +591,13 @@ func (r *GatewayReconciler) updateGatewayStatus(
 }
 
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Reconcile the referenced Gateway whenever an HTTPRoute changes.
-	mapRouteToGateways := func(ctx context.Context, obj client.Object) []reconcile.Request {
-		route, ok := obj.(*gatewayv1.HTTPRoute)
-		if !ok {
-			return nil
-		}
+	mapParentRefs := func(refs []gatewayv1.ParentReference, routeNS string) []reconcile.Request {
 		var reqs []reconcile.Request
-		for _, ref := range route.Spec.ParentRefs {
+		for _, ref := range refs {
 			if ref.Kind != nil && *ref.Kind != "Gateway" {
 				continue
 			}
-			ns := route.Namespace
+			ns := routeNS
 			if ref.Namespace != nil && *ref.Namespace != "" {
 				ns = string(*ref.Namespace)
 			}
@@ -406,8 +608,31 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return reqs
 	}
 
-	// Reconcile any Gateway that references a mutated TLS Secret.
-	mapSecretToGateways := func(ctx context.Context, obj client.Object) []reconcile.Request {
+	mapHTTPRoute := func(_ context.Context, obj client.Object) []reconcile.Request {
+		route, ok := obj.(*gatewayv1.HTTPRoute)
+		if !ok {
+			return nil
+		}
+		return mapParentRefs(route.Spec.ParentRefs, route.Namespace)
+	}
+
+	mapTLSRoute := func(_ context.Context, obj client.Object) []reconcile.Request {
+		route, ok := obj.(*gatewayv1alpha2.TLSRoute)
+		if !ok {
+			return nil
+		}
+		return mapParentRefs(route.Spec.ParentRefs, route.Namespace)
+	}
+
+	mapTCPRoute := func(_ context.Context, obj client.Object) []reconcile.Request {
+		route, ok := obj.(*gatewayv1alpha2.TCPRoute)
+		if !ok {
+			return nil
+		}
+		return mapParentRefs(route.Spec.ParentRefs, route.Namespace)
+	}
+
+	mapSecret := func(ctx context.Context, obj client.Object) []reconcile.Request {
 		var gwList gatewayv1.GatewayList
 		if err := r.List(ctx, &gwList); err != nil {
 			return nil
@@ -437,7 +662,9 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.Gateway{}).
-		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(mapRouteToGateways)).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(mapSecretToGateways)).
+		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(mapHTTPRoute)).
+		Watches(&gatewayv1alpha2.TLSRoute{}, handler.EnqueueRequestsFromMapFunc(mapTLSRoute)).
+		Watches(&gatewayv1alpha2.TCPRoute{}, handler.EnqueueRequestsFromMapFunc(mapTCPRoute)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(mapSecret)).
 		Complete(r)
 }
