@@ -11,9 +11,7 @@ A lightweight [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) impleme
 | **`TLS`** (`tls.mode: Passthrough`) | `TLSRoute` (`v1alpha2`) | Peeks the TLS `ClientHello` SNI header non-destructively and splices raw encrypted TLS bytes straight to the backend pod (no backend certs held by the controller). Can **share port 443** with `HTTPS` on a single wildcard tunnel via the SNI demultiplexer (`internal/proxy/sni.go`). |
 | **`TCP`** | `TCPRoute` (`v1alpha2`) | Forwards raw L4 TCP streams over the SSH tunnel (e.g., Postgres, Redis, SSH) to the target `Service:Port`. |
 
-## Architecture (Inspired by `caddyserver/gateway`)
-
-Modeled after [caddyserver/gateway](https://github.com/caddyserver/gateway)'s `controller-runtime` reconciliation loop and zero-downtime hot reload:
+## Architecture
 
 1. **Control Plane (`internal/controller/`)**: Watches standard Gateway API CRDs (`GatewayClass`, `Gateway`, `HTTPRoute`, `TLSRoute`, `TCPRoute`) and Kubernetes TLS `Secret`s (`kubernetes.io/tls`).
 2. **Multi-Mode SSH Tunnel Manager (`internal/tunnel/`)**: Supervises resilient outbound `golang.org/x/crypto/ssh` tunnels per listener group with keepalives and exponential backoff. `HTTPS` and `TLS` listeners on the same port (e.g., wildcard `*.example.com:443`) share a single SNI-multiplexed SSH tunnel.

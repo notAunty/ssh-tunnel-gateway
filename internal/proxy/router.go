@@ -33,9 +33,7 @@ type RouteRule struct {
 	proxy     *httputil.ReverseProxy
 }
 
-// Router is a hot-reloadable HTTP reverse proxy handler.
-// Modeled after Caddy's dynamic config swap, updating routes never drops
-// active SSH tunnels or listeners.
+// Router swaps HTTP routing tables independently of the SSH listener.
 type Router struct {
 	mu    sync.RWMutex
 	rules []RouteRule
